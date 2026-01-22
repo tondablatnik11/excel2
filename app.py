@@ -2,23 +2,27 @@ import streamlit as st
 import pandas as pd
 import io
 
-st.set_page_config(page_title="Inteligentní Spojovač", page_icon="🧩", layout="wide")
+st.set_page_config(page_title="Inteligentní Spojovač (Oprava)", page_icon="🔧", layout="wide")
 
-st.title("🧩 Sjednocení sloupců a doplnění dat")
+st.title("🔧 Sjednocení sloupců a doplnění dat")
 st.markdown("""
-Tato aplikace vezme data ze dvou souborů a **slije je do jedné tabulky pod stejné sloupce**.
+**Opravená verze:** Tato aplikace bezpečněji spojí data i v případě duplicitních zakázek nebo různých formátů.
 1. Data ze **Sešitu1** mají přednost.
-2. Pokud v Sešitu1 něco chybí (je prázdné), **doplní se to z Reportu**.
-3. Pokud v Sešitu1 chybí celá delivery, **přidá se celá** na konec.
+2. Prázdná místa se doplní z **Reportu**.
+3. Nové zakázky se přidají na konec.
 """)
 
-# Funkce pro čištění textu a ID
-def clean_id(val):
-    return str(val).replace('.0', '').strip()
+def clean_id_column(df, col_name):
+    """Bezpečně převede sloupec na text a ošetří chyby."""
+    if col_name in df.columns:
+        # Převedeme na string, odstraníme .0, ořežeme mezery a nahradíme 'nan' za prázdné
+        return df[col_name].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    return None
 
 def load_data(uploaded_file):
     if uploaded_file.name.endswith('.csv'):
-        return pd.read_csv(uploaded_file)
+        # Low memory=False pomáhá s mixovanými typy dat při načítání
+        return pd.read_csv(uploaded_file, low_memory=False)
     else:
         return pd.read_excel(uploaded_file)
 
@@ -33,29 +37,33 @@ with col2:
 
 if file_sesit and file_report:
     if st.button("Sjednotit a Doplnit"):
-        with st.spinner('Sjednocuji sloupce a doplňuji data...'):
+        with st.spinner('Analyzuji a spojuji data...'):
             try:
-                # 1. Načtení
+                # 1. Načtení dat
                 df_main = load_data(file_sesit)
                 df_new = load_data(file_report)
 
-                # Čištění názvů sloupců (odstranění mezer na konci názvů, např. "Weight (kg)   ")
+                # Čištění názvů sloupců
                 df_main.columns = df_main.columns.str.strip()
                 df_new.columns = df_new.columns.str.strip()
 
                 # Klíčový sloupec
                 key = 'DN NUMBER (SAP)'
                 
-                # Pokud se klíč v novém souboru jmenuje jinak, přejmenujeme ho
+                # Pokud se klíč v novém souboru jmenuje 'Zakázka (Delivery)', přejmenujeme ho
                 if 'Zakázka (Delivery)' in df_new.columns:
                     df_new = df_new.rename(columns={'Zakázka (Delivery)': key})
 
-                # Čištění ID (aby se to správně spárovalo)
-                df_main[key] = df_main[key].apply(clean_id)
-                df_new[key] = df_new[key].apply(clean_id)
+                # Kontrola existence klíče
+                if key not in df_main.columns or key not in df_new.columns:
+                    st.error(f"Chyba: Sloupec '{key}' nebyl nalezen v jednom ze souborů.")
+                    st.stop()
 
-                # 2. MAPOVÁNÍ SLOUPCŮ (Z češtiny do angličtiny podle Sešitu1)
-                # Tím zajistíme, že data padnou do stejných sloupců
+                # 2. PŘEVOD KLÍČŮ NA TEXT (Prevence chyby 'Conversion failed')
+                df_main[key] = clean_id_column(df_main, key)
+                df_new[key] = clean_id_column(df_new, key)
+
+                # 3. MAPOVÁNÍ SLOUPCŮ (Z češtiny do angličtiny)
                 column_mapping = {
                     'Materiál': 'Material',
                     'Počet kusů': 'Number of pieces',
@@ -64,49 +72,59 @@ if file_sesit and file_report:
                     'Počet plných KLT': 'Full KLTs',
                     'Počet prázdných KLT': 'Empty KLTs',
                     'Počet kartonů': 'Number of cartons',
-                    'Váha (KG)': 'Weight (kg)',  # Pozor, v Sešitu1 to musí sedět přesně
-                    'Detail Obalů': 'Comment'    # Například, nebo vytvoříme nový
+                    'Váha (KG)': 'Weight (kg)',
+                    'Detail Obalů': 'Comment'
                 }
-                
-                # Přejmenování v novém reportu
                 df_new = df_new.rename(columns=column_mapping)
 
-                # 3. IDENTIFIKACE STAVU (Před spojením)
+                # 4. IDENTIFIKACE STAVU
                 main_ids = set(df_main[key])
                 new_ids = set(df_new[key])
                 
-                # Určení statusu pro každý řádek
-                def get_status(row_id):
-                    if row_id in main_ids and row_id in new_ids:
+                def get_status(row_id, merge_indicator):
+                    if merge_indicator == 'both':
                         return "Existuje (Doplněno)"
-                    elif row_id in new_ids and row_id not in main_ids:
+                    elif merge_indicator == 'right_only':
                         return "NOVÉ (Přidáno)"
                     else:
                         return "Pouze v Sešitu"
 
-                # 4. SPOJENÍ (COMBINE FIRST)
-                # Nastavíme ID jako index, aby pandas věděl, co k čemu patří
-                df_main = df_main.set_index(key)
-                df_new = df_new.set_index(key)
+                # 5. BEZPEČNÉ SPOJENÍ (Merge místo Combine First)
+                # Použijeme Outer Join, abychom měli všechna data vedle se
+                merged = pd.merge(
+                    df_main,
+                    df_new,
+                    on=key,
+                    how='outer',
+                    suffixes=('', '_new'), # Původní sloupce bez přípony, nové s _new
+                    indicator=True
+                )
 
-                # Samotné sloučení: df_main má přednost, díry se lepí z df_new
-                df_final = df_main.combine_first(df_new)
+                # 6. DOPLNĚNÍ DAT (Fillna)
+                # Projdeme sloupce, které mají variantu "_new", a doplníme jimi prázdná místa v hlavních sloupcích
+                for col in merged.columns:
+                    if col.endswith('_new'):
+                        original_col = col[:-4] # Odstraní "_new"
+                        if original_col in merged.columns:
+                            # Tady se stane magie: Pokud je v originálu prázdno, vezme se hodnota z _new
+                            merged[original_col] = merged[original_col].fillna(merged[col])
                 
-                # Reset indexu, abychom měli DN NUMBER zase jako sloupec
-                df_final = df_final.reset_index()
+                # Odstraníme pomocné "_new" sloupce a merge indikátor (použijeme ho jen pro status)
+                merged['Status_Analýzy'] = merged.apply(lambda x: get_status(x[key], x['_merge']), axis=1)
+                
+                # Vyčistíme finální tabulku od pomocných sloupců
+                final_cols = [c for c in merged.columns if not c.endswith('_new') and c != '_merge']
+                # Dáme Status a Key na začátek
+                cols_order = ['Status_Analýzy', key] + [c for c in final_cols if c not in ['Status_Analýzy', key]]
+                df_final = merged[cols_order]
 
-                # Přidání sloupce Status
-                df_final.insert(0, 'Status_Analýzy', df_final[key].apply(get_status))
-
-                # 5. KONTROLA CHYBĚJÍCÍCH HODNOT
-                # Definujeme sloupce, které považujeme za povinné pro "kompletní delivery"
+                # 7. KONTROLA CHYBĚJÍCÍCH HODNOT
                 critical_cols = ['Material', 'Number of pieces', 'Weight (kg)']
                 
-                # Funkce pro kontrolu
                 def check_completeness(row):
                     missing = []
                     for col in critical_cols:
-                        if col in row.index and (pd.isna(row[col]) or str(row[col]).strip() == ''):
+                        if col in row.index and (pd.isna(row[col]) or str(row[col]).strip() == '' or str(row[col]).lower() == 'nan'):
                             missing.append(col)
                     if missing:
                         return f"⚠️ Chybí: {', '.join(missing)}"
@@ -115,7 +133,7 @@ if file_sesit and file_report:
                 df_final.insert(1, 'Kontrola_Dat', df_final.apply(check_completeness, axis=1))
 
                 # --- VÝSTUP ---
-                st.success("Hotovo! Data jsou sjednocena ve stejných sloupcích.")
+                st.success("Hotovo! Data byla úspěšně sjednocena.")
                 
                 # Statistiky
                 st.write("### Statistiky")
@@ -123,14 +141,7 @@ if file_sesit and file_report:
                 col_m1.metric("Celkový počet řádků", len(df_final))
                 col_m2.metric("Nové (přidané) řádky", len(df_final[df_final['Status_Analýzy'] == 'NOVÉ (Přidáno)']))
 
-                # Náhled problémových (nekompletních)
-                incomplete = df_final[df_final['Kontrola_Dat'] != 'OK']
-                if not incomplete.empty:
-                    st.warning(f"Nalezeno {len(incomplete)} řádků s chybějícími daty.")
-                    with st.expander("Zobrazit nekompletní řádky"):
-                        st.dataframe(incomplete)
-                
-                # Náhled výsledku
+                # Náhled
                 st.subheader("Náhled výsledné tabulky")
                 st.dataframe(df_final.head(50))
 
@@ -139,11 +150,9 @@ if file_sesit and file_report:
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     df_final.to_excel(writer, index=False, sheet_name='Final_Data')
                     
-                    # Formátování
                     workbook = writer.book
                     worksheet = writer.sheets['Final_Data']
                     
-                    # Červená pro chybějící data
                     red_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
                     green_format = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
                     
@@ -160,3 +169,4 @@ if file_sesit and file_report:
 
             except Exception as e:
                 st.error(f"Chyba při zpracování: {e}")
+                st.write("Tip: Zkontrolujte, zda soubory nejsou poškozené a zda obsahují správné sloupce.")
